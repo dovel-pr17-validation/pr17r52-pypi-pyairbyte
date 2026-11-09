@@ -1,0 +1,74 @@
+name: Release Drafter
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - 'release-candidate/**'
+
+concurrency:
+  # Group by ref so main and release-candidate branches don't serialize.
+  group: release-drafter-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read # Overridden per job below.
+
+jobs:
+  draft_release:
+    name: Draft Release
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          python-version: "3.10"
+
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+        with:
+          # Shallow clone is sufficient since we bypass dynamic versioning
+          fetch-depth: 1
+
+      - name: Create draft release (not ready)
+        uses: aaronsteers/semantic-pr-release-drafter@8ebe479080d2ecb71377d5d6622ff97ca55b4655 # v2.6.0
+        id: not-ready-draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          not-ready: true
+          # Pushes to `release-candidate/vX[.Y[.Z]]` draft `vX.Y.Z-rc.N`
+          # prereleases; pushes to `main` keep drafting stable releases.
+          prerelease-branch-rules: |
+            - branch-prefix: release-candidate/
+              prerelease-identifier: rc
+
+      - name: Build package
+        if: steps.not-ready-draft.outputs.skipped != 'true'
+        env:
+          VERSION: ${{ steps.not-ready-draft.outputs.tag-name }}
+        # Standardize by removing preceding 'v' char:
+        run: UV_DYNAMIC_VERSIONING_BYPASS="${VERSION#v}" uv build
+
+      - name: Attach assets and finalize draft
+        if: steps.not-ready-draft.outputs.skipped != 'true'
+        uses: aaronsteers/semantic-pr-release-drafter@8ebe479080d2ecb71377d5d6622ff97ca55b4655 # v2.6.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Finalize the exact draft prepared above via a strongly consistent
+          # point-read; version/tag/prerelease/SHA are reused from that release.
+          prepared-release-id: ${{ steps.not-ready-draft.outputs.id }}
+          # Pushes to `release-candidate/vX[.Y[.Z]]` draft `vX.Y.Z-rc.N`
+          # prereleases; pushes to `main` keep drafting stable releases.
+          prerelease-branch-rules: |
+            - branch-prefix: release-candidate/
+              prerelease-identifier: rc
+          attach-files: |
+            dist/*.whl
+            dist/*.tar.gz

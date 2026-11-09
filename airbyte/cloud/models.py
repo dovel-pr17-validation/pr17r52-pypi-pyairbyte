@@ -1,0 +1,462 @@
+# Copyright (c) 2026 Airbyte, Inc., all rights reserved.
+"""Public response models for Airbyte Cloud APIs."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
+from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class _WorkspaceResponseLike(Protocol):
+    workspace_id: str
+    name: str
+    data_residency: str
+    notifications: object
+
+
+class _ConnectionResponseLike(Protocol):
+    connection_id: str
+    workspace_id: str
+    source_id: str
+    destination_id: str
+    name: str
+    configurations: Any
+    prefix: str | None
+    namespace_definition: object | None
+    namespace_format: str | None
+    status: object
+
+
+class _JobResponseLike(Protocol):
+    job_id: int
+    status: object
+    bytes_synced: int | None
+    rows_synced: int | None
+    start_time: str
+
+
+class _SourceResponseLike(Protocol):
+    source_id: str
+    name: str
+    definition_id: str
+
+
+class _DestinationResponseLike(Protocol):
+    destination_id: str
+    name: str
+    definition_id: str
+    configuration: Any
+
+
+class _DeclarativeSourceDefinitionResponseLike(Protocol):
+    id: str
+    name: str
+    manifest: dict[str, Any] | None
+    version: object
+
+
+@dataclass
+class CheckResult:
+    """A cloud check result object."""
+
+    success: bool
+    """Whether the check result is valid."""
+
+    error_message: str | None = None
+    """None if the check was successful. Otherwise the failure message from the check result."""
+
+    internal_error: str | None = None
+    """None if the check was able to be run. Otherwise, this will describe the internal failure."""
+
+    def __bool__(self) -> bool:
+        """Truthy when check was successful."""
+        return self.success
+
+    def __str__(self) -> str:
+        """Get a string representation of the check result."""
+        return "Success" if self.success else f"Failed: {self.error_message}"
+
+    def __repr__(self) -> str:
+        """Get a string representation of the check result."""
+        return (
+            f"CheckResult(success={self.success}, "
+            f"error_message={self.error_message or self.internal_error})"
+        )
+
+
+class JobStatusEnum(str, Enum):
+    """Status values for an Airbyte Cloud job."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
+    SUCCEEDED = "succeeded"
+    CANCELLED = "cancelled"
+
+
+class JobTypeEnum(str, Enum):
+    """Job type values for Airbyte Cloud jobs."""
+
+    SYNC = "sync"
+    RESET = "reset"
+    REFRESH = "refresh"
+    CLEAR = "clear"
+
+
+class WorkspacePrivilegeScope(str, Enum):
+    """How broadly `list_workspaces` searches for workspaces."""
+
+    MEMBER_OF = "member_of"
+    ORGANIZATION_ADMIN = "organization_admin"
+    INSTANCE_ADMIN = "instance_admin"
+    ANY = "any"
+
+
+class CloudOrganizationBillingInfo(BaseModel):
+    """Billing status information for an Airbyte organization."""
+
+    payment_status: str | None = None
+    """Payment status of the organization."""
+
+    subscription_status: str | None = None
+    """Subscription status of the organization."""
+
+    is_account_locked: bool = False
+    """Whether the organization account is locked."""
+
+
+class CloudWorkspaceInfo(BaseModel):
+    """Information about an Airbyte workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    workspace_id: str = Field(alias="workspaceId")
+    """The workspace ID."""
+
+    name: str
+    """The workspace name."""
+
+    data_residency: str | None = Field(default=None, alias="dataResidency")
+    """The data residency setting for the workspace, if available."""
+
+    organization_id: str | None = Field(default=None, alias="organizationId")
+    """The organization ID for the workspace, if available."""
+
+    organization_name: str | None = Field(default=None, alias="organizationName")
+    """The organization name for the workspace, if available."""
+
+    notifications: dict[str, object | None] | list[dict[str, object | None]] = Field(
+        default_factory=dict
+    )
+    """Workspace notification settings."""
+
+    @classmethod
+    def from_api_response(cls, workspace: _WorkspaceResponseLike) -> CloudWorkspaceInfo:
+        """Create a public model from an internal API workspace response."""
+        return cls(
+            workspace_id=workspace.workspace_id,
+            name=workspace.name,
+            data_residency=workspace.data_residency,
+            organization_id=getattr(workspace, "organization_id", None),
+            notifications=_notifications_to_dict(workspace.notifications),
+        )
+
+    @classmethod
+    def from_mapping(cls, workspace: Mapping[str, object]) -> CloudWorkspaceInfo:
+        """Create a public model from a workspace mapping."""
+        return cls.model_validate(workspace)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable dictionary."""
+        return self.model_dump(mode="json")
+
+
+class CloudOrganizationInfo(BaseModel):
+    """Information about an Airbyte organization."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    organization_id: str = Field(alias="organizationId")
+    """The organization ID."""
+
+    organization_name: str | None = Field(default=None, alias="organizationName")
+    """The organization name, if available."""
+
+
+class CloudDefaultContextInfo(BaseModel):
+    """Explicit organization and workspace affinities for the authenticated user."""
+
+    user_id: str | None
+    """The Airbyte user ID, if available."""
+
+    user_name: str | None
+    """The authenticated user's name, if available."""
+
+    user_email: str | None
+    """The authenticated user's email, if available."""
+
+    default_workspace_id: str | None
+    """The resolved default workspace ID, if available."""
+
+    default_workspace_name: str | None
+    """The resolved default workspace name, if available."""
+
+    default_workspace_verified: bool
+    """Whether the resolved default workspace was verified as accessible."""
+
+    unvalidated_workspace_count: int = 0
+    """Number of direct workspace grants not validated due to the validation cap."""
+
+    default_organization_id: str | None
+    """The organization containing the resolved default workspace, if available."""
+
+    default_organization_name: str | None
+    """The name of the organization containing the resolved default workspace, if available."""
+
+    configured_workspace_id: str | None
+    """The explicitly configured workspace ID, if available."""
+
+    configured_organization_id: str | None
+    """The configured organization ID, if available."""
+
+    member_organizations: list[CloudOrganizationInfo]
+    """Organizations identified by explicit organization membership grants."""
+
+    member_workspaces: list[CloudWorkspaceInfo]
+    """Workspaces identified by explicit workspace membership grants."""
+
+    member_organizations_truncated: bool
+    """True if organization memberships beyond the returned list were omitted."""
+
+    member_workspaces_truncated: bool
+    """True if workspace memberships beyond the returned list were omitted."""
+
+    discovery_hints: list[str]
+    """Hints for discovering additional organizations or workspaces."""
+
+
+class CloudDefaultWorkspaceUpdateInfo(BaseModel):
+    """Result of durably updating the authenticated user's default workspace."""
+
+    user_id: str
+    """The Airbyte user ID the update applied to."""
+
+    user_email: str | None
+    """The authenticated user's email, if available."""
+
+    previous_default_workspace_id: str | None
+    """The user's previous default workspace ID, if one was set."""
+
+    default_workspace_id: str
+    """The new default workspace ID."""
+
+    default_workspace_name: str | None
+    """The new default workspace name, if available."""
+
+    organization_id: str | None
+    """The ID of the organization containing the new default workspace, if available."""
+
+    organization_name: str | None
+    """The name of the organization containing the new default workspace, if available."""
+
+    membership_basis: Literal["workspace", "organization"]
+    """Whether access was established via a direct workspace grant or an organization grant."""
+
+
+class CloudConnectionInfo(BaseModel):
+    """Information about an Airbyte Cloud connection."""
+
+    connection_id: str
+    """The connection ID."""
+
+    workspace_id: str
+    """The workspace ID."""
+
+    source_id: str
+    """The source ID."""
+
+    destination_id: str
+    """The destination ID."""
+
+    name: str
+    """The connection name."""
+
+    configurations: Any
+    """Stream configuration details for the connection."""
+
+    prefix: str | None = None
+    """The destination table prefix."""
+
+    namespace_definition: str | None = None
+    """How destination namespaces are chosen: `source`, `destination`, or `custom_format`."""
+
+    namespace_format: str | None = None
+    """The namespace format template, when `namespace_definition` is `custom_format`."""
+
+    status: str
+    """The connection status."""
+
+    @classmethod
+    def from_api_response(cls, connection: _ConnectionResponseLike) -> CloudConnectionInfo:
+        """Create a public model from an internal API connection response."""
+        return cls(
+            connection_id=connection.connection_id,
+            workspace_id=connection.workspace_id,
+            source_id=connection.source_id,
+            destination_id=connection.destination_id,
+            name=connection.name,
+            configurations=connection.configurations,
+            prefix=connection.prefix,
+            namespace_definition=(
+                _enum_value(connection.namespace_definition)
+                if connection.namespace_definition is not None
+                else None
+            ),
+            namespace_format=connection.namespace_format,
+            status=_enum_value(connection.status),
+        )
+
+
+class CloudJobInfo(BaseModel):
+    """Information about an Airbyte Cloud job."""
+
+    job_id: int
+    """The job ID."""
+
+    status: JobStatusEnum
+    """The job status."""
+
+    bytes_synced: int | None = None
+    """The number of bytes synced by the job, if available."""
+
+    rows_synced: int | None = None
+    """The number of rows synced by the job, if available."""
+
+    start_time: str
+    """The job start time."""
+
+    @classmethod
+    def from_api_response(cls, job: _JobResponseLike) -> CloudJobInfo:
+        """Create a public model from an internal API job response."""
+        return cls(
+            job_id=job.job_id,
+            status=JobStatusEnum(_enum_value(job.status)),
+            bytes_synced=job.bytes_synced,
+            rows_synced=job.rows_synced,
+            start_time=job.start_time,
+        )
+
+
+class CloudSourceInfo(BaseModel):
+    """Information about an Airbyte Cloud source."""
+
+    source_id: str
+    """The source ID."""
+
+    name: str
+    """The source name."""
+
+    definition_id: str
+    """The connector definition ID (for example, the ID for `source-postgres`)."""
+
+    @classmethod
+    def from_api_response(cls, source: _SourceResponseLike) -> CloudSourceInfo:
+        """Create a public model from an internal API source response."""
+        return cls(
+            source_id=source.source_id,
+            name=source.name,
+            definition_id=source.definition_id,
+        )
+
+
+class CloudDestinationInfo(BaseModel):
+    """Information about an Airbyte Cloud destination."""
+
+    destination_id: str
+    """The destination ID."""
+
+    name: str
+    """The destination name."""
+
+    definition_id: str
+    """The connector definition ID (for example, the ID for `destination-snowflake`)."""
+
+    configuration: dict[str, Any] | None = None
+    """The destination configuration as returned by the API; secret values are redacted by
+    the API."""
+
+    @classmethod
+    def from_api_response(
+        cls,
+        destination: _DestinationResponseLike,
+    ) -> CloudDestinationInfo:
+        """Create a public model from an internal API destination response."""
+        return cls(
+            destination_id=destination.destination_id,
+            name=destination.name,
+            definition_id=destination.definition_id,
+            configuration=_configuration_dict(destination.configuration),
+        )
+
+
+class CloudCustomSourceDefinitionInfo(BaseModel):
+    """Information about a custom Airbyte Cloud source definition."""
+
+    definition_id: str
+    """The source definition ID."""
+
+    name: str
+    """The source definition name."""
+
+    manifest: dict[str, Any] | None = None
+    """The source definition manifest."""
+
+    version: str
+    """The source definition version."""
+
+    @classmethod
+    def from_api_response(
+        cls,
+        definition: _DeclarativeSourceDefinitionResponseLike,
+    ) -> CloudCustomSourceDefinitionInfo:
+        """Create a public model from an internal API source definition response."""
+        return cls(
+            definition_id=definition.id,
+            name=definition.name,
+            manifest=definition.manifest,
+            version=str(definition.version),
+        )
+
+
+def _configuration_dict(configuration: object) -> dict[str, Any] | None:
+    """Convert an API destination configuration object into a dictionary."""
+    if configuration is None:
+        return None
+    if is_dataclass(configuration) and not isinstance(configuration, type):
+        return {str(key): value for key, value in asdict(configuration).items()}
+    if isinstance(configuration, Mapping):
+        return {str(key): value for key, value in configuration.items()}
+    return None
+
+
+def _notifications_to_dict(notifications: object) -> dict[str, object | None]:
+    """Convert workspace notification settings into a dictionary."""
+    if notifications is None:
+        return {}
+    if is_dataclass(notifications) and not isinstance(notifications, type):
+        return {str(key): value for key, value in asdict(notifications).items()}
+    if isinstance(notifications, Mapping):
+        return {str(key): value for key, value in notifications.items()}
+    return {}
+
+
+def _enum_value(value: object) -> str:
+    """Return the string value for an enum-like object."""
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)

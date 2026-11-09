@@ -1,0 +1,877 @@
+# Copyright (c) 2026 Airbyte, Inc., all rights reserved.
+"""Unit tests for Airbyte Cloud MCP tools."""
+
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Callable, cast
+
+import pytest
+from airbyte.cloud.connectors import CheckResult
+from airbyte.cloud.models import (
+    CloudDefaultContextInfo,
+    CloudOrganizationInfo,
+    CloudWorkspaceInfo,
+    JobStatusEnum,
+)
+from airbyte.mcp import cloud as cloud_mcp
+from airbyte.mcp.cloud import (
+    CloudConnectionResult,
+    CloudDestinationResult,
+    CloudSourceResult,
+    ConnectorCheckResult,
+    SyncJobResult,
+)
+from fastmcp import Context
+
+
+@dataclass
+class _SyncResultLike:
+    """Subset of `SyncResult` used by connection status tests."""
+
+    job_id: int
+    status: JobStatusEnum
+    start_time: datetime
+    bytes_synced: int = 0
+    records_synced: int = 0
+    job_url: str = "https://cloud.airbyte.com/jobs"
+
+    def get_job_status(self) -> JobStatusEnum:
+        """Return the configured job status."""
+        return self.status
+
+    def is_job_complete(self) -> bool:
+        """Return whether the test sync job is complete."""
+        return True
+
+
+@dataclass
+class _CloudSourceLike:
+    """Subset of `CloudSource` used by tested MCP list tools."""
+
+    source_id: str
+    name: str
+    connector_url: str
+
+
+@dataclass
+class _CloudDestinationLike:
+    """Subset of `CloudDestination` used by tested MCP list tools."""
+
+    destination_id: str
+    name: str
+    connector_url: str
+
+
+@dataclass
+class _CheckableConnectorLike:
+    """Subset of `CloudConnector` used by connector check tests."""
+
+    connector_id: str
+    connector_type: str
+    result: CheckResult
+    received_raise_on_error: bool | None = None
+
+    def check(self, *, raise_on_error: bool = True) -> CheckResult:
+        """Capture the error handling option and return the configured result."""
+        self.received_raise_on_error = raise_on_error
+        return self.result
+
+
+class _ConnectorCheckWorkspace:
+    """Return checkable source and destination test doubles."""
+
+    def __init__(self, result: CheckResult) -> None:
+        """Create source and destination test doubles."""
+        self.source = _CheckableConnectorLike(
+            connector_id="source-id",
+            connector_type="source",
+            result=result,
+        )
+        self.destination = _CheckableConnectorLike(
+            connector_id="destination-id",
+            connector_type="destination",
+            result=result,
+        )
+
+    def get_source(self, *, source_id: str) -> _CheckableConnectorLike:
+        """Return the source test double."""
+        assert source_id == self.source.connector_id
+        return self.source
+
+    def get_destination(self, *, destination_id: str) -> _CheckableConnectorLike:
+        """Return the destination test double."""
+        assert destination_id == self.destination.connector_id
+        return self.destination
+
+
+@dataclass
+class _CloudConnectionLike:
+    """Subset of `CloudConnection` used by tested MCP list tools."""
+
+    connection_id: str
+    name: str
+    connection_url: str
+    source_id: str
+    destination_id: str
+    failed: bool = False
+
+    def get_previous_sync_logs(self, *, limit: int = 20) -> list[_SyncResultLike]:
+        """Return one completed sync result for connection status tests."""
+        _ = limit
+        status = JobStatusEnum.FAILED if self.failed else JobStatusEnum.SUCCEEDED
+        return [
+            _SyncResultLike(
+                job_id=1,
+                status=status,
+                start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+        ]
+
+
+@dataclass
+class _CancelableConnectionLike:
+    """Subset of `CloudConnection` used by sync cancellation tests."""
+
+    sync_result: _SyncResultLike
+    received_job_id: int | None = None
+
+    def cancel_sync(self, *, job_id: int | None = None) -> _SyncResultLike:
+        """Capture the job ID and return the cancelled sync result."""
+        self.received_job_id = job_id
+        return self.sync_result
+
+
+class _CancellationWorkspace:
+    """Return a connection test double for sync cancellation tests."""
+
+    def __init__(self, connection: _CancelableConnectionLike) -> None:
+        """Create a workspace test double."""
+        self.connection = connection
+
+    def get_connection(self, *, connection_id: str) -> _CancelableConnectionLike:
+        """Return the configured connection."""
+        assert connection_id == "connection-id"
+        return self.connection
+
+
+class _CloudWorkspace:
+    """Capture `limit` values passed from MCP list tools."""
+
+    def __init__(self) -> None:
+        """Create a workspace test double."""
+        self.limits: dict[str, int | None] = {}
+
+    def list_sources(self, *, limit: int | None = None) -> list[_CloudSourceLike]:
+        """Capture source list limit and return source test data."""
+        self.limits["sources"] = limit
+        items = [
+            _CloudSourceLike(
+                source_id=f"source-{index}",
+                name="target" if index == 2 else "miss",
+                connector_url=f"https://cloud.airbyte.com/source-{index}",
+            )
+            for index in range(1, 3)
+        ]
+        return items if limit is None else items[:limit]
+
+    def list_destinations(
+        self, *, limit: int | None = None
+    ) -> list[_CloudDestinationLike]:
+        """Capture destination list limit and return destination test data."""
+        self.limits["destinations"] = limit
+        items = [
+            _CloudDestinationLike(
+                destination_id=f"destination-{index}",
+                name="target" if index == 2 else "miss",
+                connector_url=f"https://cloud.airbyte.com/destination-{index}",
+            )
+            for index in range(1, 3)
+        ]
+        return items if limit is None else items[:limit]
+
+    def list_connections(
+        self, *, limit: int | None = None
+    ) -> list[_CloudConnectionLike]:
+        """Capture connection list limit and return connection test data."""
+        self.limits["connections"] = limit
+        items = [
+            _CloudConnectionLike(
+                connection_id=f"connection-{index}",
+                name="target" if index == 2 else "miss",
+                connection_url=f"https://cloud.airbyte.com/connection-{index}",
+                source_id=f"source-connection-{index}",
+                destination_id=f"destination-connection-{index}",
+                failed=index == 2,
+            )
+            for index in range(1, 3)
+        ]
+        return items if limit is None else items[:limit]
+
+
+@pytest.mark.parametrize(
+    "tool,limit_key,extra_kwargs",
+    [
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_source_connectors,
+            "sources",
+            {},
+            id="sources",
+        ),
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_destination_connectors,
+            "destinations",
+            {},
+            id="destinations",
+        ),
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_connections,
+            "connections",
+            {"with_connection_status": False, "failing_connections_only": False},
+            id="connections",
+        ),
+    ],
+)
+def test_mcp_cloud_list_tools_pass_limit_to_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: Callable[..., list[object]],
+    limit_key: str,
+    extra_kwargs: dict[str, object],
+) -> None:
+    """Verify Cloud MCP list tools forward `limit` to workspace list operations."""
+    workspace = _CloudWorkspace()
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    results = tool(
+        ctx=object(),
+        workspace_id="workspace-id",
+        name_contains=None,
+        limit=1,
+        **extra_kwargs,
+    )
+
+    assert workspace.limits[limit_key] == 1
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize(
+    "tool,limit_key,extra_kwargs",
+    [
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_source_connectors,
+            "sources",
+            {},
+            id="sources",
+        ),
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_destination_connectors,
+            "destinations",
+            {},
+            id="destinations",
+        ),
+        pytest.param(
+            cloud_mcp.list_deployed_cloud_connections,
+            "connections",
+            {"with_connection_status": False, "failing_connections_only": False},
+            id="connections",
+        ),
+    ],
+)
+def test_mcp_cloud_list_tools_apply_limit_after_name_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: Callable[
+        ...,
+        list[CloudSourceResult]
+        | list[CloudDestinationResult]
+        | list[CloudConnectionResult],
+    ],
+    limit_key: str,
+    extra_kwargs: dict[str, object],
+) -> None:
+    """Verify Cloud MCP list tools cap results after local name filtering."""
+    workspace = _CloudWorkspace()
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    results = tool(
+        ctx=object(),
+        workspace_id="workspace-id",
+        name_contains="target",
+        limit=1,
+        **extra_kwargs,
+    )
+
+    assert workspace.limits[limit_key] is None
+    assert len(results) == 1
+    assert results[0].name == "target"
+
+
+def test_mcp_cloud_connections_apply_limit_after_status_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify connection list caps results after local status filtering."""
+    workspace = _CloudWorkspace()
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    results = cloud_mcp.list_deployed_cloud_connections(
+        ctx=cast(Context, object()),
+        workspace_id="workspace-id",
+        name_contains=None,
+        limit=1,
+        with_connection_status=False,
+        failing_connections_only=True,
+    )
+
+    assert workspace.limits["connections"] is None
+    assert len(results) == 1
+    assert results[0].id == "connection-2"
+
+
+@pytest.mark.parametrize(
+    ("tool", "connector_id_parameter", "connector_id", "connector_type"),
+    [
+        pytest.param(
+            cloud_mcp.check_cloud_source,
+            "source_id",
+            "source-id",
+            "source",
+            id="source",
+        ),
+        pytest.param(
+            cloud_mcp.check_cloud_destination,
+            "destination_id",
+            "destination-id",
+            "destination",
+            id="destination",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("check_result", "expected_success", "expected_message"),
+    [
+        pytest.param(
+            CheckResult(success=True),
+            True,
+            None,
+            id="success",
+        ),
+        pytest.param(
+            CheckResult(success=False, error_message="Invalid credentials"),
+            False,
+            "Invalid credentials",
+            id="error-message",
+        ),
+        pytest.param(
+            CheckResult(success=False, internal_error="Check service unavailable"),
+            False,
+            "Check service unavailable",
+            id="internal-error",
+        ),
+        pytest.param(
+            CheckResult(success=False),
+            False,
+            "Connector check failed without a failure message.",
+            id="missing-message",
+        ),
+    ],
+)
+def test_mcp_cloud_connector_checks_map_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: Callable[..., object],
+    connector_id_parameter: str,
+    connector_id: str,
+    connector_type: str,
+    check_result: CheckResult,
+    expected_success: bool,
+    expected_message: str | None,
+) -> None:
+    """Verify Cloud MCP connector checks map result fields and disable raising."""
+    workspace = _ConnectorCheckWorkspace(check_result)
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    result = cast(
+        ConnectorCheckResult,
+        tool(
+            ctx=cast(Context, object()),
+            workspace_id="workspace-id",
+            **{connector_id_parameter: connector_id},
+        ),
+    )
+
+    connector = (
+        workspace.source if connector_type == "source" else workspace.destination
+    )
+    assert result.connector_id == connector_id
+    assert result.connector_type == connector_type
+    assert result.succeeded is expected_success
+    assert result.message == expected_message
+    assert connector.received_raise_on_error is False
+
+
+def test_cancel_cloud_sync_returns_cancelled_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the Cloud MCP cancellation tool maps the cancelled sync result."""
+    sync_result = _SyncResultLike(
+        job_id=42,
+        status=JobStatusEnum.CANCELLED,
+        bytes_synced=123,
+        records_synced=456,
+        start_time=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        job_url="https://cloud.airbyte.com/jobs/42",
+    )
+    connection = _CancelableConnectionLike(sync_result=sync_result)
+    workspace = _CancellationWorkspace(connection)
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    result = cast(
+        SyncJobResult,
+        cloud_mcp.cancel_cloud_sync(
+            ctx=cast(Context, object()),
+            connection_id="connection-id",
+            job_id=42,
+            workspace_id="workspace-id",
+        ),
+    )
+
+    assert connection.received_job_id == 42
+    assert result.job_id == 42
+    assert result.status == "cancelled"
+    assert result.bytes_synced == 123
+    assert result.records_synced == 456
+    assert result.start_time == "2026-01-02T03:04:05+00:00"
+    assert result.job_url == "https://cloud.airbyte.com/jobs/42"
+
+
+def test_cancel_cloud_sync_forwards_missing_job_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the Cloud MCP cancellation tool forwards a missing job ID."""
+    connection = _CancelableConnectionLike(
+        sync_result=_SyncResultLike(
+            job_id=42,
+            status=JobStatusEnum.CANCELLED,
+            start_time=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+    )
+    workspace = _CancellationWorkspace(connection)
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_workspace",
+        lambda ctx, workspace_id=None: workspace,
+    )
+
+    cloud_mcp.cancel_cloud_sync(
+        ctx=cast(Context, object()),
+        connection_id="connection-id",
+        job_id=None,
+        workspace_id="workspace-id",
+    )
+
+    assert connection.received_job_id is None
+
+
+def test_get_default_cloud_context_returns_context_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = CloudDefaultContextInfo(
+        user_id="user-id",
+        user_name="User",
+        user_email="user@example.com",
+        default_workspace_id="workspace-id",
+        default_workspace_name="Workspace",
+        default_workspace_verified=True,
+        unvalidated_workspace_count=0,
+        default_organization_id="organization-id",
+        default_organization_name="Organization",
+        configured_workspace_id=None,
+        configured_organization_id=None,
+        member_organizations=[
+            CloudOrganizationInfo(
+                organization_id="organization-id",
+                organization_name="Organization",
+            )
+        ],
+        member_workspaces=[
+            CloudWorkspaceInfo(
+                workspace_id="workspace-id",
+                name="Workspace",
+                organization_id="organization-id",
+                organization_name="Organization",
+                notifications={"webhook": {"enabled": True}},
+            )
+        ],
+        member_organizations_truncated=True,
+        member_workspaces_truncated=True,
+        discovery_hints=[],
+    )
+
+    class ContextClient:
+        def get_default_context_for_user(self) -> CloudDefaultContextInfo:
+            return context
+
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_client", lambda _: ContextClient())
+
+    result = cloud_mcp.get_default_cloud_context(cast(Context, object()))
+
+    assert result.user_id == "user-id"
+    assert result.member_organizations[0].organization_id == "organization-id"
+    assert result.member_workspaces[0].workspace_id == "workspace-id"
+    assert result.member_workspaces[0].workspace_name == "Workspace"
+    assert result.member_workspaces[0].organization_id == "organization-id"
+    assert result.member_workspaces[0].organization_name == "Organization"
+    assert "notifications" not in result.model_dump(mode="json")["member_workspaces"][0]
+    assert result.message.startswith(
+        "Resolved default workspace Workspace (workspace-id) "
+        "in organization Organization (organization-id). "
+    )
+    assert "membership-based, not access-based" in result.message
+    assert (
+        "Only the first 1 organization memberships and 1 workspace memberships are shown"
+        in result.message
+    )
+
+
+def test_get_default_cloud_context_flags_unverified_default_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = CloudDefaultContextInfo(
+        user_id="user-id",
+        user_name="User",
+        user_email="user@example.com",
+        default_workspace_id="deleted-workspace",
+        default_workspace_name=None,
+        default_workspace_verified=False,
+        unvalidated_workspace_count=0,
+        default_organization_id=None,
+        default_organization_name=None,
+        configured_workspace_id="deleted-workspace",
+        configured_organization_id=None,
+        member_organizations=[],
+        member_workspaces=[],
+        member_organizations_truncated=False,
+        member_workspaces_truncated=False,
+        discovery_hints=[],
+    )
+
+    class ContextClient:
+        def get_default_context_for_user(self) -> CloudDefaultContextInfo:
+            return context
+
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_client", lambda _: ContextClient())
+
+    result = cloud_mcp.get_default_cloud_context(cast(Context, object()))
+
+    assert result.message.startswith(
+        "Default workspace ID deleted-workspace could not be verified "
+        "(it may have been deleted or is not accessible with these credentials). These"
+    )
+
+
+def test_describe_cloud_workspace_includes_parent_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = SimpleNamespace(
+        organization_id="org-id", organization_name="Organization"
+    )
+    workspace = SimpleNamespace(
+        workspace_id="workspace-id",
+        api_root="https://api.airbyte.com/v1",
+        client_id=None,
+        client_secret=None,
+        bearer_token=None,
+        workspace_url="https://cloud.airbyte.com/workspaces/workspace-id",
+        get_organization=lambda **_: organization,
+    )
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_workspace", lambda *_: workspace)
+    monkeypatch.setattr(
+        cloud_mcp.api_util,
+        "get_workspace",
+        lambda **_: SimpleNamespace(workspace_id="workspace-id", name="Workspace"),
+    )
+    result = cloud_mcp.describe_cloud_workspace(
+        cast(Context, object()), workspace_id=None
+    )
+    assert result.organization_id == "org-id"
+    assert result.organization_name == "Organization"
+
+
+def test_describe_cloud_workspace_allows_missing_parent_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = SimpleNamespace(
+        workspace_id="workspace-id",
+        api_root="https://api.airbyte.com/v1",
+        client_id=None,
+        client_secret=None,
+        bearer_token=None,
+        workspace_url=None,
+        get_organization=lambda **_: None,
+    )
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_workspace", lambda *_: workspace)
+    monkeypatch.setattr(
+        cloud_mcp.api_util,
+        "get_workspace",
+        lambda **_: SimpleNamespace(workspace_id="workspace-id", name="Workspace"),
+    )
+    result = cloud_mcp.describe_cloud_workspace(
+        cast(Context, object()), workspace_id=None
+    )
+    assert result.organization_id is None
+    assert result.organization_name is None
+
+
+def test_get_cloud_organization_billing_status_returns_billing_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = SimpleNamespace(
+        organization_id="org-id",
+        organization_name="Organization",
+        get_billing_status=lambda: SimpleNamespace(
+            payment_status="okay",
+            subscription_status="subscribed",
+            is_account_locked=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_client",
+        lambda _: SimpleNamespace(get_organization=lambda **_: organization),
+    )
+    result = cloud_mcp.get_cloud_organization_billing_status(
+        cast(Context, object()), organization_id=None, organization_name=None
+    )
+    assert result.billing_info_available is True
+    assert result.payment_status == "okay"
+    assert result.subscription_status == "subscribed"
+    assert result.is_account_locked is False
+
+
+def test_get_cloud_organization_billing_status_handles_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get_billing_status() -> None:
+        raise cloud_mcp.AirbyteError(message="not allowed")
+
+    organization = SimpleNamespace(
+        organization_id="org-id",
+        organization_name="Organization",
+        get_billing_status=get_billing_status,
+    )
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_client",
+        lambda _: SimpleNamespace(get_organization=lambda **_: organization),
+    )
+    result = cloud_mcp.get_cloud_organization_billing_status(
+        cast(Context, object()), organization_id=None, organization_name=None
+    )
+    assert result.billing_info_available is False
+    assert result.payment_status is None
+    assert result.is_account_locked is False
+    assert result.message == "Billing information could not be retrieved: not allowed"
+
+
+def test_describe_cloud_organization_excludes_billing_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = SimpleNamespace(
+        organization_id="org-id",
+        organization_name="Organization",
+        email="org@example.com",
+    )
+    monkeypatch.setattr(
+        cloud_mcp,
+        "_get_cloud_client",
+        lambda _: SimpleNamespace(get_organization=lambda **_: organization),
+    )
+    result = cloud_mcp.describe_cloud_organization(
+        cast(Context, object()), organization_id=None, organization_name=None
+    )
+    assert result.id == "org-id"
+    assert not hasattr(result, "payment_status")
+    assert not hasattr(result, "subscription_status")
+    assert not hasattr(result, "is_account_locked")
+
+
+def test_set_default_cloud_workspace_returns_update_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the tool maps the client result and states the durable impact."""
+    update = cloud_mcp.CloudDefaultWorkspaceUpdateInfo(
+        user_id="user-id",
+        user_email="user@example.com",
+        previous_default_workspace_id="old-workspace",
+        default_workspace_id="workspace-id",
+        default_workspace_name="Workspace",
+        organization_id="organization-id",
+        organization_name="Organization",
+        membership_basis="workspace",
+    )
+
+    class ContextClient:
+        def set_default_workspace_for_user(
+            self,
+            *,
+            user_email: str,
+            workspace_id: str,
+        ) -> cloud_mcp.CloudDefaultWorkspaceUpdateInfo:
+            assert user_email == "user@example.com"
+            assert workspace_id == "workspace-id"
+            return update
+
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_client", lambda _: ContextClient())
+
+    result = cloud_mcp.set_default_cloud_workspace(
+        cast(Context, object()),
+        user_email="user@example.com",
+        workspace_id="workspace-id",
+    )
+
+    assert result.user_id == "user-id"
+    assert result.default_workspace_id == "workspace-id"
+    assert result.previous_default_workspace_id == "old-workspace"
+    assert result.membership_basis == "workspace"
+    assert result.message == (
+        "Default workspace durably set to Workspace (workspace-id) for "
+        "user@example.com. This applies to future MCP sessions and the Airbyte "
+        "Cloud web app."
+    )
+
+
+@pytest.mark.parametrize(
+    "tool,id_kwarg,getter,deleter",
+    [
+        pytest.param(
+            cloud_mcp.permanently_delete_cloud_source,
+            "source_id",
+            "get_source",
+            "permanently_delete_source",
+            id="source",
+        ),
+        pytest.param(
+            cloud_mcp.permanently_delete_cloud_destination,
+            "destination_id",
+            "get_destination",
+            "permanently_delete_destination",
+            id="destination",
+        ),
+        pytest.param(
+            cloud_mcp.permanently_delete_cloud_connection,
+            "connection_id",
+            "get_connection",
+            "permanently_delete_connection",
+            id="connection",
+        ),
+    ],
+)
+def test_permanently_delete_cloud_tools_pass_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: Callable[..., str],
+    id_kwarg: str,
+    getter: str,
+    deleter: str,
+) -> None:
+    """Verify Cloud MCP delete tools forward an explicit `workspace_id`."""
+    seen_workspace_ids: list[str | None] = []
+    resource = SimpleNamespace(name="delete-me-resource")
+    workspace = SimpleNamespace(**{
+        getter: lambda **_: resource,
+        deleter: lambda **_: None,
+    })
+
+    def fake_get_cloud_workspace(
+        ctx: object,
+        workspace_id: str | None = None,
+    ) -> SimpleNamespace:
+        seen_workspace_ids.append(workspace_id)
+        return workspace
+
+    monkeypatch.setattr(cloud_mcp, "_get_cloud_workspace", fake_get_cloud_workspace)
+    monkeypatch.setattr(cloud_mcp, "check_guid_created_in_session", lambda _: None)
+
+    result = tool(
+        cast(Context, object()),
+        **{id_kwarg: "resource-id"},
+        name="delete-me-resource",
+        workspace_id="explicit-workspace-id",
+    )
+
+    assert seen_workspace_ids == ["explicit-workspace-id"]
+    assert "resource-id" in result
+
+
+def test_deploy_noop_destination_to_cloud_uses_destination_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the No-op deploy tool accepts `destination_name` and documents its params."""
+    deployed: dict[str, object] = {}
+
+    def fake_deploy_destination(**kwargs: object) -> SimpleNamespace:
+        deployed.update(kwargs)
+        return SimpleNamespace(
+            connector_id="noop-id",
+            connector_url="https://cloud.airbyte.com/noop-id",
+        )
+
+    workspace = SimpleNamespace(deploy_destination=fake_deploy_destination)
+    monkeypatch.setattr(
+        cloud_mcp, "_get_cloud_workspace", lambda ctx, workspace_id=None: workspace
+    )
+    monkeypatch.setattr(cloud_mcp, "get_noop_destination", object)
+    monkeypatch.setattr(cloud_mcp, "register_guid_created_in_session", lambda _: None)
+
+    result = cloud_mcp.deploy_noop_destination_to_cloud(
+        cast(Context, object()),
+        destination_name="my-noop",
+        workspace_id=None,
+        unique=False,
+    )
+
+    assert deployed["name"] == "my-noop"
+    assert deployed["unique"] is False
+    assert "noop-id" in result
+
+    default_result = cloud_mcp.deploy_noop_destination_to_cloud(
+        cast(Context, object()), workspace_id=None
+    )
+    assert deployed["name"] == "No-op Destination"
+    assert deployed["unique"] is True
+    assert "noop-id" in default_result
+
+
+def test_deploy_noop_destination_to_cloud_params_have_descriptions() -> None:
+    """Verify every No-op deploy tool parameter exposes a schema description."""
+    signature = inspect.signature(cloud_mcp.deploy_noop_destination_to_cloud)
+    for param_name in ("destination_name", "workspace_id", "unique"):
+        annotation = signature.parameters[param_name].annotation
+        field_infos = [
+            meta
+            for meta in getattr(annotation, "__metadata__", ())
+            if hasattr(meta, "description")
+        ]
+        assert field_infos, param_name
+        assert field_infos[0].description, param_name
+    assert "name" not in signature.parameters
